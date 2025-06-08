@@ -50,12 +50,16 @@ func Start(cfg config.Config) error {
 					bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, "Ошибка при поиске сервиса"))
 					continue
 				}
-			} else if chat.IsPrivate() {
-				totpSecret, err = repository.FindService(cfg.DBConn, serviceName, update.Message.From.ID)
-				if err != nil {
-					log.Println(err)
-					bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, "Ошибка при поиске сервиса"))
-					continue
+			} else {
+				if chat.IsPrivate() {
+					totpSecret, err = repository.FindService(cfg.DBConn, serviceName, update.Message.From.ID)
+					if err != nil {
+						log.Println(err)
+						bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, "Ошибка при поиске сервиса"))
+						continue
+					} else {
+						continue
+					}
 				}
 			}
 
@@ -91,16 +95,17 @@ func Start(cfg config.Config) error {
 					bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, "Ошибка при добавлении сервиса"))
 					continue
 				}
-			}
-			if chat.IsPrivate() {
-				err = repository.AddService(cfg.DBConn, serviceName, secret, update.Message.From.ID)
-				if err != nil {
-					log.Println(err)
-					bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, "Ошибка при добавлении сервиса"))
+			} else {
+				if chat.IsPrivate() {
+					err = repository.AddService(cfg.DBConn, serviceName, secret, update.Message.From.ID)
+					if err != nil {
+						log.Println(err)
+						bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, "Ошибка при добавлении сервиса"))
+						continue
+					}
+				} else {
 					continue
 				}
-			} else {
-				continue
 			}
 
 			msg := tgbotapi.NewMessage(update.Message.Chat.ID, "✅ Сервис "+serviceName+" добавлен!")
@@ -122,11 +127,15 @@ func Start(cfg config.Config) error {
 					bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, "Ошибка при чтении сервисов"))
 					continue
 				}
-			} else if chat.IsPrivate() {
-				serviceNames, err = repository.AllService(cfg.DBConn, update.Message.From.ID)
-				if err != nil {
-					log.Println(err)
-					bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, "Ошибка при чтении сервисов"))
+			} else {
+				if chat.IsPrivate() {
+					serviceNames, err = repository.AllService(cfg.DBConn, update.Message.From.ID)
+					if err != nil {
+						log.Println(err)
+						bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, "Ошибка при чтении сервисов"))
+						continue
+					}
+				} else {
 					continue
 				}
 			}
@@ -165,36 +174,37 @@ func Start(cfg config.Config) error {
 					bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, "Ошибка при удалении сервиса"))
 					continue
 				}
-			}
-			if chat.IsPrivate() {
-				err = repository.DeleteService(cfg.DBConn, serviceName, update.Message.From.ID)
-				if err != nil {
-					log.Println(err)
-					bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, "Ошибка при удалении сервиса"))
+			} else {
+				if chat.IsPrivate() {
+					err = repository.DeleteService(cfg.DBConn, serviceName, update.Message.From.ID)
+					if err != nil {
+						log.Println(err)
+						bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, "Ошибка при удалении сервиса"))
+						continue
+					}
+				} else {
 					continue
 				}
-			} else {
-				continue
 			}
 
 			msg := tgbotapi.NewMessage(update.Message.Chat.ID, "❌ Сервис "+serviceName+" удален!")
 			bot.Send(msg)
 
 		case "help":
-			helpText := `🤖 Доступные команды:
-
-			/add <сервис> <секрет> – добавить новый сервис с 2FA (TOTP)
-			Пример: /add github JBSWY3DPEHPK3PXP
-
-			/code <сервис> – получить одноразовый код для сервиса
-			Пример: /code github
-
-			/show – показать все сохранённые сервисы
-
-			/help – вывести эту справку`
+			helpText := "🤖 *Доступные команды:*\n\n" +
+				"/add `<сервис>` `<секрет>` – добавить новый сервис с 2FA (TOTP)\n" +
+				"Пример: `/add github JBSWY3DPEHPK3PXP`\n\n" +
+				"/code `<сервис>` – получить одноразовый код для сервиса\n" +
+				"Пример: `/code github`\n\n" +
+				"/delete `<сервис>` – удалить сохранённый сервис\n" +
+				"Пример: `/delete github`\n\n" +
+				"/show – показать все сохранённые сервисы\n" +
+				"/help – вывести эту справку"
 
 			msg := tgbotapi.NewMessage(update.Message.Chat.ID, helpText)
+			msg.ParseMode = "Markdown"
 			bot.Send(msg)
+
 		default:
 			continue
 		}
