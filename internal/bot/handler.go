@@ -2,8 +2,10 @@ package bot
 
 import (
 	"2fa-tgbot/internal/config"
+	"2fa-tgbot/internal/repository"
 	"2fa-tgbot/internal/totp"
 	"log"
+	"strings"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
@@ -12,6 +14,7 @@ func Start(cfg config.Config) error {
 
 	bot, err := tgbotapi.NewBotAPI(cfg.TelegramToken)
 	if err != nil {
+		log.Println("Ошибка запуска бота")
 		return err
 	}
 
@@ -24,18 +27,174 @@ func Start(cfg config.Config) error {
 			continue
 		}
 
-		switch update.Message.Text {
-		case "/code":
-			code, err := totp.GenerateCode(cfg.TotpSecret)
+		switch update.Message.Command() {
+		case "code":
+
+			args := update.Message.CommandArguments()
+			parts := strings.Fields(args)
+
+			if len(parts) != 1 {
+				bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID,
+					"Формат: /code <сервис> \nПример: /code github"))
+				break
+			}
+
+			var totpSecret string = ""
+			chat := update.Message.Chat
+			serviceName := parts[0]
+
+			if chat.IsGroup() || chat.IsSuperGroup() {
+				totpSecret, err = repository.FindService(cfg.DBConn, serviceName, update.Message.Chat.ID)
+				if err != nil {
+					log.Println(err)
+					bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, "Ошибка при поиске сервиса"))
+					continue
+				}
+			} else if chat.IsPrivate() {
+				totpSecret, err = repository.FindService(cfg.DBConn, serviceName, update.Message.From.ID)
+				if err != nil {
+					log.Println(err)
+					bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, "Ошибка при поиске сервиса"))
+					continue
+				}
+			}
+
+			code, err := totp.GenerateCode(totpSecret)
 			if err != nil {
 				log.Println(err)
 				bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, "Ошибка генерации кода"))
 				continue
 			}
-			msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Ваш TOTP код:<pre>"+code+"</pre>")
+			msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Ваш код:<pre>"+code+"</pre>")
 			msg.ParseMode = "HTML"
 			bot.Send(msg)
 
+		case "add":
+			args := update.Message.CommandArguments()
+			parts := strings.Fields(args)
+
+			if len(parts) != 2 {
+				bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID,
+					"Формат: /add <сервис> <секрет>\nПример: /add github AAAAABBBBCC"))
+				break
+			}
+
+			serviceName := parts[0]
+			secret := parts[1]
+
+			chat := update.Message.Chat
+
+			if chat.IsGroup() || chat.IsSuperGroup() {
+				err = repository.AddService(cfg.DBConn, serviceName, secret, update.Message.Chat.ID)
+				if err != nil {
+					log.Println(err)
+					bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, "Ошибка при добавлении сервиса"))
+					continue
+				}
+			}
+			if chat.IsPrivate() {
+				err = repository.AddService(cfg.DBConn, serviceName, secret, update.Message.From.ID)
+				if err != nil {
+					log.Println(err)
+					bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, "Ошибка при добавлении сервиса"))
+					continue
+				}
+			} else {
+				continue
+			}
+
+			msg := tgbotapi.NewMessage(update.Message.Chat.ID, "✅ Сервис "+serviceName+" добавлен!")
+			bot.Send(msg)
+
+			bot.Request(tgbotapi.DeleteMessageConfig{
+				ChatID:    update.Message.Chat.ID,
+				MessageID: update.Message.MessageID,
+			})
+
+		case "show":
+			chat := update.Message.Chat
+			var serviceNames []string
+
+			if chat.IsGroup() || chat.IsSuperGroup() {
+				serviceNames, err = repository.AllService(cfg.DBConn, update.Message.Chat.ID)
+				if err != nil {
+					log.Println(err)
+					bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, "Ошибка при чтении сервисов"))
+					continue
+				}
+			} else if chat.IsPrivate() {
+				serviceNames, err = repository.AllService(cfg.DBConn, update.Message.From.ID)
+				if err != nil {
+					log.Println(err)
+					bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, "Ошибка при чтении сервисов"))
+					continue
+				}
+			}
+
+			if len(serviceNames) == 0 {
+				msg := tgbotapi.NewMessage(chat.ID, "⚠️ Нет доступных сервисов.")
+				bot.Send(msg)
+				continue
+			}
+
+			response := "📋 Список сервисов:\n"
+			for _, name := range serviceNames {
+				response += "- " + name + "\n"
+			}
+
+			msg := tgbotapi.NewMessage(chat.ID, response)
+			bot.Send(msg)
+
+		case "delete":
+			args := update.Message.CommandArguments()
+			parts := strings.Fields(args)
+
+			if len(parts) != 1 {
+				bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID,
+					"Формат: /delete <сервис>\nПример: /delete github"))
+				break
+			}
+
+			serviceName := parts[0]
+			chat := update.Message.Chat
+
+			if chat.IsGroup() || chat.IsSuperGroup() {
+				err = repository.DeleteService(cfg.DBConn, serviceName, update.Message.Chat.ID)
+				if err != nil {
+					log.Println(err)
+					bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, "Ошибка при удалении сервиса"))
+					continue
+				}
+			}
+			if chat.IsPrivate() {
+				err = repository.DeleteService(cfg.DBConn, serviceName, update.Message.From.ID)
+				if err != nil {
+					log.Println(err)
+					bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, "Ошибка при удалении сервиса"))
+					continue
+				}
+			} else {
+				continue
+			}
+
+			msg := tgbotapi.NewMessage(update.Message.Chat.ID, "❌ Сервис "+serviceName+" удален!")
+			bot.Send(msg)
+
+		case "help":
+			helpText := `🤖 Доступные команды:
+
+			/add <сервис> <секрет> – добавить новый сервис с 2FA (TOTP)
+			Пример: /add github JBSWY3DPEHPK3PXP
+
+			/code <сервис> – получить одноразовый код для сервиса
+			Пример: /code github
+
+			/show – показать все сохранённые сервисы
+
+			/help – вывести эту справку`
+
+			msg := tgbotapi.NewMessage(update.Message.Chat.ID, helpText)
+			bot.Send(msg)
 		default:
 			continue
 		}
