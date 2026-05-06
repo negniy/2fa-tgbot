@@ -1,3 +1,5 @@
-.envм
+*.env
 *.sql
 *.tar
+.env
+.env

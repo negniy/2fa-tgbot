@@ -130,6 +130,11 @@ func handleCallback(bot *tgbotapi.BotAPI, cb *tgbotapi.CallbackQuery, cfg config
 			sendWithCleanup(bot, chatID, tgbotapi.NewMessage(chatID, "Ошибка поиска секрета"))
 			break
 		}
+		secret, err = cfg.CryptoService.Decrypt(secret)
+		if err != nil {
+			sendWithCleanup(bot, chatID, tgbotapi.NewMessage(chatID, "Ошибка дешифровки секрета"))
+			break
+		}
 		code, err := totp.GenerateCode(secret)
 		if err != nil {
 			sendWithCleanup(bot, chatID, tgbotapi.NewMessage(chatID, "Ошибка генерации"))
@@ -196,7 +201,12 @@ func handleAddFlow(bot *tgbotapi.BotAPI, msg *tgbotapi.Message, cfg config.Confi
 
 	case 2:
 		secret := strings.TrimSpace(msg.Text)
-		err := repository.AddService(cfg.DBConn, state.Service, secret, tgID)
+		secret, err := cfg.CryptoService.Encrypt(secret)
+		if err != nil {
+			sendWithCleanup(bot, msg.Chat.ID, tgbotapi.NewMessage(msg.Chat.ID, "❌ Ошибка при добавлении сервиса"))
+			break
+		}
+		err = repository.AddService(cfg.DBConn, state.Service, secret, tgID)
 		if err != nil {
 			sendWithCleanup(bot, msg.Chat.ID, tgbotapi.NewMessage(msg.Chat.ID, "❌ Ошибка при добавлении сервиса"))
 		} else {
