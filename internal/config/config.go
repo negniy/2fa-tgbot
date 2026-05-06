@@ -1,7 +1,9 @@
 package config
 
 import (
+	crypto "2fa-tgbot/internal/security"
 	"database/sql"
+	"encoding/base64"
 	"fmt"
 	"log"
 	"os"
@@ -14,6 +16,7 @@ import (
 type Config struct {
 	TelegramToken string
 	DBConn        *sql.DB
+	CryptoService *crypto.CryptoService
 }
 
 func Load() (Config, error) {
@@ -50,8 +53,19 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 
+	cryptoKey := os.Getenv("MASTER_KEY")
+	encodedKey, err := base64.StdEncoding.DecodeString(cryptoKey)
+	if err != nil {
+		return Config{}, fmt.Errorf("invalid MASTER_KEY: %w", err)
+	}
+	cryptoService, err := crypto.NewCryptoService(encodedKey)
+	if err != nil {
+		return Config{}, err
+	}
+
 	return Config{
 		TelegramToken: os.Getenv("TELEGRAM_TOKEN"),
 		DBConn:        db,
+		CryptoService: cryptoService,
 	}, nil
 }
