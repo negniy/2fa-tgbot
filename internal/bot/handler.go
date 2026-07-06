@@ -7,6 +7,7 @@ import (
 	"context"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -22,9 +23,9 @@ type LastCodeMsg struct {
 	Service   string
 }
 
-var userAddState = make(map[int64]*AddState)
-var lastBotMessage = make(map[int64]int)
-var lastCodeMessages = make(map[int64]LastCodeMsg)
+var userAddState sync.Map
+var lastBotMessage sync.Map
+var lastCodeMessages sync.Map
 
 func Start(ctx context.Context, cfg config.Config) error {
 	bot, err := tgbotapi.NewBotAPI(cfg.TelegramToken)
@@ -47,13 +48,16 @@ func Start(ctx context.Context, cfg config.Config) error {
 			}
 		case <-ctx.Done():
 			log.Println("Shutting down bot...")
+			bot.StopReceivingUpdates()
+			return nil
 		}
 	}
 }
 
 func baseHandleMessage(bot *tgbotapi.BotAPI, cfg config.Config, update *tgbotapi.Update) {
 	tgID := resolveID(update.Message)
-	if state, ok := userAddState[tgID]; ok {
+	if state, ok := userAddState.Load(tgID); ok {
+		state := state.(*AddState)
 		handleAddFlow(bot, update.Message, cfg, state)
 		return
 	}
@@ -100,7 +104,7 @@ func handleCallback(bot *tgbotapi.BotAPI, cb *tgbotapi.CallbackQuery, cfg config
 		case "show":
 			showServices(bot, chatID, contextID, cfg)
 		case "add":
-			userAddState[contextID] = &AddState{Step: 1}
+			userAddState.Store(contextID, &AddState{Step: 1})
 			sendWithCleanup(bot, chatID, tgbotapi.NewMessage(chatID, "Введите имя сервиса:"))
 		case "help":
 			sendHelp(bot, chatID)
@@ -146,10 +150,10 @@ func handleCallback(bot *tgbotapi.BotAPI, cb *tgbotapi.CallbackQuery, cfg config
 		msg.ParseMode = "HTML"
 		sent, err := bot.Send(msg)
 		if err == nil {
-			lastCodeMessages[contextID] = LastCodeMsg{
+			lastCodeMessages.Store(contextID, LastCodeMsg{
 				MessageID: sent.MessageID,
 				Service:   service,
-			}
+			})
 
 			// Рассчитываем оставшееся время жизни кода
 			period := int64(30)
@@ -160,7 +164,7 @@ func handleCallback(bot *tgbotapi.BotAPI, cb *tgbotapi.CallbackQuery, cfg config
 				time.Sleep(time.Duration(remaining) * time.Second)
 
 				edit := tgbotapi.NewEditMessageText(chatID, msgID,
-					"🔄 *Код обновился, повторите попытку:*\n<pre>••••••</pre>")
+					"🔄 <b>Код обновился, повторите попытку:</b>\n<pre>••••••</pre>")
 				edit.ParseMode = "HTML"
 				edit.ReplyMarkup = &tgbotapi.InlineKeyboardMarkup{
 					InlineKeyboard: [][]tgbotapi.InlineKeyboardButton{
@@ -182,8 +186,8 @@ func handleCallback(bot *tgbotapi.BotAPI, cb *tgbotapi.CallbackQuery, cfg config
 		}
 		sendWithCleanup(bot, chatID, tgbotapi.NewMessage(chatID, "❌ Сервис "+service+" удалён"))
 
-		if prev, ok := lastCodeMessages[contextID]; ok && prev.Service == service {
-			delete(lastCodeMessages, contextID)
+		if prev, ok := lastCodeMessages.Load(contextID); ok && prev.(LastCodeMsg).Service == service {
+			lastCodeMessages.Delete(contextID)
 		}
 	}
 
@@ -213,7 +217,7 @@ func handleAddFlow(bot *tgbotapi.BotAPI, msg *tgbotapi.Message, cfg config.Confi
 			sendWithCleanup(bot, msg.Chat.ID, tgbotapi.NewMessage(msg.Chat.ID, "✅ Сервис "+state.Service+" добавлен!"))
 			showServices(bot, msg.Chat.ID, tgID, cfg)
 		}
-		delete(userAddState, tgID)
+		userAddState.Delete(tgID)
 	}
 }
 
@@ -272,15 +276,15 @@ func sendBackButton(bot *tgbotapi.BotAPI, chatID int64) {
 }
 
 func sendWithCleanup(bot *tgbotapi.BotAPI, chatID int64, msg tgbotapi.Chattable) {
-	if lastID, ok := lastBotMessage[chatID]; ok {
-		bot.Request(tgbotapi.NewDeleteMessage(chatID, lastID))
+	if lastID, ok := lastBotMessage.Load(chatID); ok {
+		bot.Request(tgbotapi.NewDeleteMessage(chatID, lastID.(int)))
 	}
 
 	switch m := msg.(type) {
 	case tgbotapi.MessageConfig:
 		sent, err := bot.Send(m)
 		if err == nil {
-			lastBotMessage[chatID] = sent.MessageID
+			lastBotMessage.Store(chatID, sent.MessageID)
 		}
 	default:
 		bot.Send(msg)
