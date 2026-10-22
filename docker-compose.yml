@@ -1,35 +1,64 @@
-version: "3.9"
-
 services:
   db:
     image: postgres:17
     container_name: tgbot_db
     restart: always
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: ${DB_PASSWORD}
-      POSTGRES_DB: tgbot
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
+      POSTGRES_DB: ${DB_NAME:-totpbot}
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - ./backup.sql:/docker-entrypoint-initdb.d/backup.sql
+    # Порт доступен только с этой машины (для локального go run), не снаружи.
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: tgbot_redis
+    restart: always
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+    # Пароль берётся из окружения контейнера, а не подставляется в compose-файл.
+    command: ["sh", "-c", "exec redis-server --appendonly yes --requirepass \"$$REDIS_PASSWORD\""]
+    volumes:
+      - redisdata:/data
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 
   bot:
     build: .
     container_name: tgbot_app
     restart: always
     depends_on:
-      - db
-    env_file:
-      - .env
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     environment:
-      TELEGRAM_TOKEN: ${TELEGRAM_TOKEN}
+      TELEGRAM_TOKEN: ${TELEGRAM_TOKEN:?TELEGRAM_TOKEN is required}
+      MASTER_KEY: ${MASTER_KEY:?MASTER_KEY is required}
       DB_HOST: db
       DB_PORT: 5432
-      DB_USER: postgres
+      DB_USER: ${DB_USER:-postgres}
       DB_PASSWORD: ${DB_PASSWORD}
-      DB_NAME: tgbot
+      DB_NAME: ${DB_NAME:-totpbot}
+      DB_SSLMODE: disable
+      REDIS_ADDR: redis:6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      ENABLE_GROUPS: ${ENABLE_GROUPS:-true}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
 
 volumes:
   pgdata:
+  redisdata:
