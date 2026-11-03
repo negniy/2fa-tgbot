@@ -47,10 +47,44 @@ func NewSecretService(
 	}
 }
 
-// AddSecret шифрует сырой секрет и сохраняет его под владельцем.
-// rawSecret приходит уже как SecretValue, поэтому не может утечь в логи.
-func (s *SecretService) AddSecret(ctx context.Context, owner Owner, tag string, rawSecret SecretValue) error {
-	encrypted, err := s.crypter.Encrypt(rawSecret)
+// CheckNewName нормализует имя нового сервиса и проверяет, что у владельца
+// такого ещё нет. Позволяет отвергнуть имя ДО того, как пользователь
+// пришлёт секрет. Возвращает ErrInvalidName или ErrAlreadyExists; во
+// втором случае нормализованное имя тоже возвращается — для сообщения.
+func (s *SecretService) CheckNewName(ctx context.Context, owner Owner, rawName string) (string, error) {
+	name, err := NormalizeServiceName(rawName)
+	if err != nil {
+		return "", err
+	}
+	// Сервисов у владельца единицы-десятки, отдельный запрос в порт ради
+	// проверки существования не нужен. Окончательно дубль всё равно
+	// отсекает уникальный индекс при Add.
+	services, err := s.repo.List(ctx, owner)
+	if err != nil {
+		return "", err
+	}
+	for _, svc := range services {
+		if svc.Tag == name {
+			return name, ErrAlreadyExists
+		}
+	}
+	return name, nil
+}
+
+// AddSecret проверяет и нормализует имя и секрет, шифрует секрет и
+// сохраняет его под владельцем. rawSecret приходит уже как SecretValue,
+// поэтому не может утечь в логи. Ошибки валидации — ErrInvalidName и
+// ErrInvalidSecret.
+func (s *SecretService) AddSecret(ctx context.Context, owner Owner, rawName string, rawSecret SecretValue) error {
+	tag, err := NormalizeServiceName(rawName)
+	if err != nil {
+		return err
+	}
+	secret, err := NormalizeSecret(rawSecret)
+	if err != nil {
+		return err
+	}
+	encrypted, err := s.crypter.Encrypt(secret)
 	if err != nil {
 		s.record(ctx, owner, EventError)
 		return fmt.Errorf("encrypt: %w", err)

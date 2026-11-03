@@ -2,6 +2,9 @@ package bot
 
 import (
 	"context"
+	"fmt"
+
+	"2fa-tgbot/internal/core"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
@@ -16,6 +19,16 @@ const msgTemporarilyUnavailable = "⏳ Сервис временно недос�
 // welcomeText — приветствие на /start.
 const welcomeText = "👋 Привет! Я храню секреты двухфакторной аутентификации " +
 	"(в зашифрованном виде) и выдаю по ним одноразовые коды."
+
+// nameRulesText — правила имени сервиса (см. core.NormalizeServiceName).
+var nameRulesText = fmt.Sprintf("⚠️ Имя должно быть от 1 до %d символов, "+
+	"без управляющих символов и не начинаться с «/».", core.MaxServiceNameLen)
+
+// secretPromptText — запрос секрета на шаге 2 flow добавления.
+const secretPromptText = "Теперь введите секретный ключ (base32). Его показывают " +
+	"при включении 2FA рядом с QR-кодом, обычно по ссылке «Не удаётся " +
+	"отсканировать?». Пробелы и регистр не важны.\n\n" +
+	"Сообщение с ключом будет сразу удалено."
 
 // reply отправляет простое текстовое сообщение с очисткой предыдущего.
 func (b *Bot) reply(ctx context.Context, chatID int64, text string) {
