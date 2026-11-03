@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -10,6 +11,7 @@ import (
 // CodeResult — результат генерации кода: сам код и сколько секунд он ещё
 // действует (для UI, который затирает код по истечении окна).
 type CodeResult struct {
+	Tag              string
 	Code             string
 	SecondsRemaining int64
 }
@@ -66,15 +68,15 @@ func (s *SecretService) AddSecret(ctx context.Context, owner Owner, tag string, 
 
 // GetCode находит секрет, дешифрует его и генерирует TOTP-код с остатком
 // времени. Открытый секрет живёт только внутри этого метода.
-func (s *SecretService) GetCode(ctx context.Context, owner Owner, tag string) (CodeResult, error) {
-	encrypted, err := s.repo.Find(ctx, owner, tag)
+func (s *SecretService) GetCode(ctx context.Context, owner Owner, id int64) (CodeResult, error) {
+	rec, err := s.repo.Find(ctx, owner, id)
 	if err != nil {
-		if err != ErrNotFound {
+		if !errors.Is(err, ErrNotFound) {
 			s.record(ctx, owner, EventError)
 		}
 		return CodeResult{}, err
 	}
-	secret, err := s.crypter.Decrypt(encrypted)
+	secret, err := s.crypter.Decrypt(rec.Encrypted)
 	if err != nil {
 		s.record(ctx, owner, EventError)
 		return CodeResult{}, fmt.Errorf("decrypt: %w", err)
@@ -86,23 +88,37 @@ func (s *SecretService) GetCode(ctx context.Context, owner Owner, tag string) (C
 	}
 	remaining := s.period - (time.Now().Unix() % s.period)
 	s.record(ctx, owner, EventCodeRequested)
-	return CodeResult{Code: code, SecondsRemaining: remaining}, nil
+	return CodeResult{Tag: rec.Tag, Code: code, SecondsRemaining: remaining}, nil
 }
 
-// DeleteSecret удаляет сервис владельца.
-func (s *SecretService) DeleteSecret(ctx context.Context, owner Owner, tag string) error {
-	if err := s.repo.Delete(ctx, owner, tag); err != nil {
-		if err != ErrNotFound {
+// GetSecretInfo возвращает сведения о сервисе владельца без расшифровки
+// секрета (для экранов, где нужно лишь имя).
+func (s *SecretService) GetSecretInfo(ctx context.Context, owner Owner, id int64) (SecretInfo, error) {
+	rec, err := s.repo.Find(ctx, owner, id)
+	if err != nil {
+		if !errors.Is(err, ErrNotFound) {
 			s.record(ctx, owner, EventError)
 		}
-		return err
+		return SecretInfo{}, err
 	}
-	s.record(ctx, owner, EventSecretDeleted)
-	return nil
+	return rec.SecretInfo, nil
 }
 
-// ListSecrets возвращает имена сервисов владельца.
-func (s *SecretService) ListSecrets(ctx context.Context, owner Owner) ([]string, error) {
+// DeleteSecret удаляет сервис владельца и возвращает его имя.
+func (s *SecretService) DeleteSecret(ctx context.Context, owner Owner, id int64) (string, error) {
+	tag, err := s.repo.Delete(ctx, owner, id)
+	if err != nil {
+		if !errors.Is(err, ErrNotFound) {
+			s.record(ctx, owner, EventError)
+		}
+		return "", err
+	}
+	s.record(ctx, owner, EventSecretDeleted)
+	return tag, nil
+}
+
+// ListSecrets возвращает сервисы владельца.
+func (s *SecretService) ListSecrets(ctx context.Context, owner Owner) ([]SecretInfo, error) {
 	services, err := s.repo.List(ctx, owner)
 	if err != nil {
 		s.record(ctx, owner, EventError)

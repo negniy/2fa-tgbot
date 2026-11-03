@@ -84,9 +84,9 @@ func TestRedisLastCodeMessage(t *testing.T) {
 	s, _ := newTestRedisStore(t)
 	owner := core.NewUserOwner(7)
 
-	_ = s.SetLastCodeMessage(ctx, owner, core.LastCodeMsg{MessageID: 555, Service: "gh"})
+	_ = s.SetLastCodeMessage(ctx, owner, core.LastCodeMsg{MessageID: 555, SecretID: 9})
 	msg, ok, _ := s.GetLastCodeMessage(ctx, owner)
-	if !ok || msg.MessageID != 555 || msg.Service != "gh" {
+	if !ok || msg.MessageID != 555 || msg.SecretID != 9 {
 		t.Fatalf("unexpected: %+v ok=%v", msg, ok)
 	}
 	_ = s.DeleteLastCodeMessage(ctx, owner)

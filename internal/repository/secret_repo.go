@@ -21,21 +21,22 @@ func NewSecretRepo(db *sql.DB) *SecretRepo {
 	return &SecretRepo{db: db}
 }
 
-// Find возвращает зашифрованный секрет. sql.ErrNoRows → core.ErrNotFound.
-func (r *SecretRepo) Find(ctx context.Context, owner core.Owner, tag string) (string, error) {
-	var encrypted string
+// Find возвращает секрет владельца по ID. Условие на владельца в WHERE
+// обязательно: чужой ID даёт core.ErrNotFound (sql.ErrNoRows).
+func (r *SecretRepo) Find(ctx context.Context, owner core.Owner, id int64) (core.SecretRecord, error) {
+	var rec core.SecretRecord
 	err := r.db.QueryRowContext(ctx,
-		`SELECT secret FROM secret
-		 WHERE owner_kind = $1 AND owner_id = $2 AND tag = $3`,
-		string(owner.Kind), owner.ID, tag,
-	).Scan(&encrypted)
+		`SELECT id, tag, secret FROM secret
+		 WHERE owner_kind = $1 AND owner_id = $2 AND id = $3`,
+		string(owner.Kind), owner.ID, id,
+	).Scan(&rec.ID, &rec.Tag, &rec.Encrypted)
 	if errors.Is(err, sql.ErrNoRows) {
-		return "", core.ErrNotFound
+		return core.SecretRecord{}, core.ErrNotFound
 	}
 	if err != nil {
-		return "", err
+		return core.SecretRecord{}, err
 	}
-	return encrypted, nil
+	return rec, nil
 }
 
 // Add сохраняет зашифрованный секрет. Нарушение уникального индекса
@@ -52,32 +53,31 @@ func (r *SecretRepo) Add(ctx context.Context, owner core.Owner, tag, encrypted s
 	return err
 }
 
-// Delete удаляет сервис. Если ничего не удалено — core.ErrNotFound.
-func (r *SecretRepo) Delete(ctx context.Context, owner core.Owner, tag string) error {
-	res, err := r.db.ExecContext(ctx,
+// Delete удаляет сервис владельца по ID и возвращает его имя. Если ничего
+// не удалено — core.ErrNotFound.
+func (r *SecretRepo) Delete(ctx context.Context, owner core.Owner, id int64) (string, error) {
+	var tag string
+	err := r.db.QueryRowContext(ctx,
 		`DELETE FROM secret
-		 WHERE owner_kind = $1 AND owner_id = $2 AND tag = $3`,
-		string(owner.Kind), owner.ID, tag,
-	)
+		 WHERE owner_kind = $1 AND owner_id = $2 AND id = $3
+		 RETURNING tag`,
+		string(owner.Kind), owner.ID, id,
+	).Scan(&tag)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", core.ErrNotFound
+	}
 	if err != nil {
-		return err
+		return "", err
 	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if n == 0 {
-		return core.ErrNotFound
-	}
-	return nil
+	return tag, nil
 }
 
-// List возвращает имена всех сервисов владельца.
-func (r *SecretRepo) List(ctx context.Context, owner core.Owner) ([]string, error) {
+// List возвращает все сервисы владельца, отсортированные по имени.
+func (r *SecretRepo) List(ctx context.Context, owner core.Owner) ([]core.SecretInfo, error) {
 	rows, err := r.db.QueryContext(ctx,
-		`SELECT tag FROM secret
+		`SELECT id, tag FROM secret
 		 WHERE owner_kind = $1 AND owner_id = $2
-		 ORDER BY tag`,
+		 ORDER BY tag, id`,
 		string(owner.Kind), owner.ID,
 	)
 	if err != nil {
@@ -85,13 +85,13 @@ func (r *SecretRepo) List(ctx context.Context, owner core.Owner) ([]string, erro
 	}
 	defer rows.Close()
 
-	var services []string
+	var services []core.SecretInfo
 	for rows.Next() {
-		var tag string
-		if err := rows.Scan(&tag); err != nil {
+		var info core.SecretInfo
+		if err := rows.Scan(&info.ID, &info.Tag); err != nil {
 			return nil, err
 		}
-		services = append(services, tag)
+		services = append(services, info)
 	}
 	return services, rows.Err()
 }

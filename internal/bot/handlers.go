@@ -3,6 +3,7 @@ package bot
 import (
 	"context"
 	"errors"
+	"html"
 	"strings"
 	"time"
 
@@ -11,8 +12,8 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
-// handleMessage обрабатывает входящие сообщения: сначала проверяет активный
-// flow добавления, иначе — команды.
+// handleMessage обрабатывает входящие сообщения: обычный текст — шаг
+// активного flow добавления, команда — команда.
 func (b *Bot) handleMessage(ctx context.Context, msg *tgbotapi.Message) {
 	owner, ok := b.resolveOwner(ctx, msg.Chat, msg.From.ID)
 	if !ok {
@@ -20,30 +21,34 @@ func (b *Bot) handleMessage(ctx context.Context, msg *tgbotapi.Message) {
 		return
 	}
 
-	// Активный пошаговый ввод?
-	st, exists, err := b.state.GetAddState(ctx, owner)
-	switch {
-	case err != nil && !msg.IsCommand():
-		// Не знаем, идёт ли ввод: сообщение может оказаться секретом.
-		b.log.Error("get add state failed", "err", err)
-		b.handleUnknownFlowMessage(ctx, msg)
-		return
-	case err == nil && exists:
-		b.handleAddFlow(ctx, msg, owner, *st)
+	if !msg.IsCommand() {
+		st, exists, err := b.state.GetAddState(ctx, owner)
+		switch {
+		case err != nil:
+			// Не знаем, идёт ли ввод: сообщение может оказаться секретом.
+			b.log.Error("get add state failed", "err", err)
+			b.handleUnknownFlowMessage(ctx, msg)
+		case exists:
+			b.handleAddFlow(ctx, msg, owner, *st)
+		}
 		return
 	}
 
-	if !msg.IsCommand() {
-		return
-	}
+	// Команда прерывает незавершённый ввод: иначе следующий текст был бы
+	// принят за имя сервиса или секрет.
+	b.cancelAddFlow(ctx, owner)
 
 	switch msg.Command() {
+	case "start":
+		b.sendMainMenu(ctx, msg.Chat.ID, welcomeText)
 	case "menu":
-		b.sendMainMenu(ctx, msg.Chat.ID)
+		b.sendMainMenu(ctx, msg.Chat.ID, "")
 	case "show":
-		b.showServices(ctx, msg.Chat.ID, owner)
+		b.showServices(ctx, msg.Chat.ID, owner, "")
+	case "cancel":
+		b.sendMainMenu(ctx, msg.Chat.ID, "Действие отменено.")
 	case "help":
-		b.sendHelp(msg.Chat.ID)
+		b.sendHelp(ctx, msg.Chat.ID)
 	default:
 		b.reply(ctx, msg.Chat.ID, "Неизвестная команда. Введите /menu или /help")
 	}
@@ -61,108 +66,146 @@ func (b *Bot) handleCallback(ctx context.Context, cb *tgbotapi.CallbackQuery) {
 	}
 
 	data := cb.Data
-	switch {
-	case strings.HasPrefix(data, "menu:"):
-		b.handleMenu(ctx, chatID, owner, strings.TrimPrefix(data, "menu:"))
-	case strings.HasPrefix(data, "service:"):
-		b.showServiceActions(ctx, chatID, strings.TrimPrefix(data, "service:"))
-	case strings.HasPrefix(data, "code:"):
-		b.sendCode(ctx, chatID, owner, strings.TrimPrefix(data, "code:"))
-	case strings.HasPrefix(data, "delete:"):
-		b.deleteService(ctx, chatID, owner, strings.TrimPrefix(data, "delete:"))
+	// Любая кнопка, кроме «Добавить», означает, что пользователь ушёл из
+	// flow добавления, — сбрасываем его, чтобы следующий текст не был
+	// принят за имя сервиса или секрет.
+	if data != cbMenu+"add" {
+		b.cancelAddFlow(ctx, owner)
+	}
+
+	if action, found := strings.CutPrefix(data, cbMenu); found {
+		b.handleMenu(ctx, chatID, owner, action)
+		return
+	}
+	if id, ok := parseIDCallback(data, cbService); ok {
+		b.showServiceActions(ctx, chatID, owner, id)
+	} else if id, ok := parseIDCallback(data, cbCode); ok {
+		b.sendCode(ctx, chatID, owner, id)
+	} else if id, ok := parseIDCallback(data, cbDelete); ok {
+		b.confirmDelete(ctx, chatID, owner, id)
+	} else if id, ok := parseIDCallback(data, cbDeleteConfirm); ok {
+		b.deleteService(ctx, chatID, owner, id)
 	}
 }
 
 func (b *Bot) handleMenu(ctx context.Context, chatID int64, owner core.Owner, action string) {
 	switch action {
 	case "main":
-		b.sendMainMenu(ctx, chatID)
+		b.sendMainMenu(ctx, chatID, "")
 	case "show":
-		b.showServices(ctx, chatID, owner)
+		b.showServices(ctx, chatID, owner, "")
 	case "add":
 		if err := b.state.SetAddState(ctx, owner, core.AddState{Step: 1}); err != nil {
 			b.log.Error("set add state failed", "err", err)
 			b.reply(ctx, chatID, msgTemporarilyUnavailable)
 			return
 		}
-		b.reply(ctx, chatID, "Введите имя сервиса:")
+		b.sendPrompt(ctx, chatID, "Введите имя сервиса:")
+	case "cancel":
+		b.sendMainMenu(ctx, chatID, "Действие отменено.")
 	case "help":
-		b.sendHelp(chatID)
-		b.sendBackButton(ctx, chatID)
+		b.sendHelp(ctx, chatID)
 	}
 }
 
-func (b *Bot) showServiceActions(ctx context.Context, chatID int64, service string) {
-	row := tgbotapi.NewInlineKeyboardRow(
-		tgbotapi.NewInlineKeyboardButtonData("🔐 Получить код", "code:"+service),
-		tgbotapi.NewInlineKeyboardButtonData("🗑 Удалить", "delete:"+service),
-	)
-	back := tgbotapi.NewInlineKeyboardRow(
-		tgbotapi.NewInlineKeyboardButtonData("🔙 Назад", "menu:show"),
-	)
-	msg := tgbotapi.NewMessage(chatID, "Выберите действие для *"+service+"*:")
-	msg.ParseMode = "Markdown"
-	msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(row, back)
-	b.sendWithCleanup(ctx, chatID, msg)
+// cancelAddFlow сбрасывает незавершённый flow добавления владельца. Ошибка
+// не критична: состояние всё равно истечёт по TTL.
+func (b *Bot) cancelAddFlow(ctx context.Context, owner core.Owner) {
+	if err := b.state.DeleteAddState(ctx, owner); err != nil {
+		b.log.Warn("delete add state failed", "err", err)
+	}
 }
 
-func (b *Bot) sendCode(ctx context.Context, chatID int64, owner core.Owner, service string) {
-	res, err := b.svc.GetCode(ctx, owner, service)
+func (b *Bot) showServiceActions(ctx context.Context, chatID int64, owner core.Owner, id int64) {
+	info, err := b.svc.GetSecretInfo(ctx, owner, id)
 	if err != nil {
-		if errors.Is(err, core.ErrNotFound) {
-			b.reply(ctx, chatID, "Сервис не найден")
-		} else {
-			b.reply(ctx, chatID, "Ошибка получения кода")
-		}
+		b.replyServiceError(ctx, chatID, err)
+		return
+	}
+	markup := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🔐 Получить код", idCallback(cbCode, id)),
+			tgbotapi.NewInlineKeyboardButtonData("🗑 Удалить", idCallback(cbDelete, id)),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🔙 Назад", cbMenu+"show"),
+		),
+	)
+	b.sendHTML(ctx, chatID, "Выберите действие для <b>"+html.EscapeString(info.Tag)+"</b>:", &markup)
+}
+
+func (b *Bot) sendCode(ctx context.Context, chatID int64, owner core.Owner, id int64) {
+	res, err := b.svc.GetCode(ctx, owner, id)
+	if err != nil {
+		b.replyServiceError(ctx, chatID, err)
 		return
 	}
 
-	text := "Код для " + service + ": <pre>" + res.Code + "</pre>"
+	text := "Код для <b>" + html.EscapeString(res.Tag) + "</b>: <pre>" + res.Code + "</pre>"
 	msg := tgbotapi.NewMessage(chatID, text)
-	msg.ParseMode = "HTML"
+	msg.ParseMode = tgbotapi.ModeHTML
 	sent, err := b.api.Send(msg)
 	if err != nil {
+		b.log.Warn("send code failed", "err", err)
 		return
 	}
 
 	_ = b.state.SetLastCodeMessage(ctx, owner, core.LastCodeMsg{
 		MessageID: sent.MessageID,
-		Service:   service,
+		SecretID:  id,
 	})
 
 	// По истечении окна кода затираем сообщение.
-	go b.expireCode(chatID, sent.MessageID, service, res.SecondsRemaining)
+	go b.expireCode(chatID, sent.MessageID, id, res.SecondsRemaining)
 }
 
 // expireCode затирает сообщение с кодом по истечении TOTP-окна.
-func (b *Bot) expireCode(chatID int64, msgID int, service string, after int64) {
+func (b *Bot) expireCode(chatID int64, msgID int, id int64, after int64) {
 	time.Sleep(time.Duration(after) * time.Second)
 	edit := tgbotapi.NewEditMessageText(chatID, msgID,
 		"🔄 <b>Код обновился, повторите попытку:</b>\n<pre>••••••</pre>")
-	edit.ParseMode = "HTML"
+	edit.ParseMode = tgbotapi.ModeHTML
 	edit.ReplyMarkup = &tgbotapi.InlineKeyboardMarkup{
 		InlineKeyboard: [][]tgbotapi.InlineKeyboardButton{
-			{tgbotapi.NewInlineKeyboardButtonData("🔁 Отправить ещё раз", "code:"+service)},
+			{tgbotapi.NewInlineKeyboardButtonData("🔁 Отправить ещё раз", idCallback(cbCode, id))},
 		},
 	}
 	b.api.Send(edit)
 }
 
-func (b *Bot) deleteService(ctx context.Context, chatID int64, owner core.Owner, service string) {
-	err := b.svc.DeleteSecret(ctx, owner, service)
+// confirmDelete спрашивает подтверждение: удаление 2FA-секрета необратимо
+// и может лишить пользователя доступа к аккаунту.
+func (b *Bot) confirmDelete(ctx context.Context, chatID int64, owner core.Owner, id int64) {
+	info, err := b.svc.GetSecretInfo(ctx, owner, id)
 	if err != nil {
-		if errors.Is(err, core.ErrNotFound) {
-			b.reply(ctx, chatID, "Сервис не найден")
-		} else {
-			b.reply(ctx, chatID, "Ошибка удаления")
-		}
+		b.replyServiceError(ctx, chatID, err)
 		return
 	}
-	b.reply(ctx, chatID, "❌ Сервис "+service+" удалён")
+	markup := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🗑 Да, удалить", idCallback(cbDeleteConfirm, id)),
+			tgbotapi.NewInlineKeyboardButtonData("Отмена", idCallback(cbService, id)),
+		),
+	)
+	b.sendHTML(ctx, chatID,
+		"Удалить сервис <b>"+html.EscapeString(info.Tag)+"</b>?\n\n"+
+			"Получить коды для него больше не получится. Убедитесь, что 2FA "+
+			"отключена в самом сервисе или у вас есть резервные коды.",
+		&markup)
+}
 
-	if prev, ok, _ := b.state.GetLastCodeMessage(ctx, owner); ok && prev.Service == service {
+func (b *Bot) deleteService(ctx context.Context, chatID int64, owner core.Owner, id int64) {
+	tag, err := b.svc.DeleteSecret(ctx, owner, id)
+	if err != nil {
+		b.replyServiceError(ctx, chatID, err)
+		return
+	}
+
+	if prev, ok, _ := b.state.GetLastCodeMessage(ctx, owner); ok && prev.SecretID == id {
 		_ = b.state.DeleteLastCodeMessage(ctx, owner)
 	}
+
+	b.showServices(ctx, chatID, owner, "❌ Сервис <b>"+html.EscapeString(tag)+"</b> удалён.")
 }
 
 // handleAddFlow ведёт пошаговое добавление сервиса.
@@ -176,7 +219,7 @@ func (b *Bot) handleAddFlow(ctx context.Context, msg *tgbotapi.Message, owner co
 			b.reply(ctx, msg.Chat.ID, msgTemporarilyUnavailable)
 			return
 		}
-		b.reply(ctx, msg.Chat.ID, "Теперь введите секрет (base32):")
+		b.sendPrompt(ctx, msg.Chat.ID, "Теперь введите секрет (base32):")
 
 	case 2:
 		rawSecret := core.NewSecret(strings.TrimSpace(msg.Text))
@@ -186,18 +229,15 @@ func (b *Bot) handleAddFlow(ctx context.Context, msg *tgbotapi.Message, owner co
 		deleted := b.deleteUserMessage(msg)
 
 		err := b.svc.AddSecret(ctx, owner, st.Service, rawSecret)
-		if derr := b.state.DeleteAddState(ctx, owner); derr != nil {
-			// Не критично: состояние истечёт по TTL.
-			b.log.Warn("delete add state failed", "err", derr)
-		}
+		b.cancelAddFlow(ctx, owner)
 		if !deleted {
 			b.warnSecretNotDeleted(msg.Chat.ID)
 		}
 
 		switch {
 		case err == nil:
-			b.reply(ctx, msg.Chat.ID, "✅ Сервис "+st.Service+" добавлен!")
-			b.showServices(ctx, msg.Chat.ID, owner)
+			b.showServices(ctx, msg.Chat.ID, owner,
+				"✅ Сервис <b>"+html.EscapeString(st.Service)+"</b> добавлен!")
 		case errors.Is(err, core.ErrAlreadyExists):
 			b.reply(ctx, msg.Chat.ID, "⚠️ Сервис с таким именем уже существует")
 		default:
@@ -238,22 +278,45 @@ func (b *Bot) warnSecretNotDeleted(chatID int64) {
 			"В группе боту нужно право администратора на удаление сообщений."))
 }
 
-func (b *Bot) showServices(ctx context.Context, chatID int64, owner core.Owner) {
+// showServices показывает список сервисов владельца. header (HTML, уже
+// экранированный) выводится над списком — например, результат действия.
+func (b *Bot) showServices(ctx context.Context, chatID int64, owner core.Owner, header string) {
 	services, err := b.svc.ListSecrets(ctx, owner)
-	if err != nil || len(services) == 0 {
-		b.reply(ctx, chatID, "⚠️ Нет доступных сервисов")
+	if err != nil {
+		b.log.Error("list secrets failed", "err", err)
+		b.reply(ctx, chatID, msgTemporarilyUnavailable)
 		return
 	}
+	if header != "" {
+		header += "\n\n"
+	}
+
 	var buttons [][]tgbotapi.InlineKeyboardButton
-	for _, name := range services {
+	for _, s := range services {
 		buttons = append(buttons, tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("🔧 "+name, "service:"+name),
+			tgbotapi.NewInlineKeyboardButtonData("🔧 "+s.Tag, idCallback(cbService, s.ID)),
+		))
+	}
+	text := header + "📋 Ваши сервисы:"
+	if len(services) == 0 {
+		text = header + "Сохранённых сервисов пока нет."
+		buttons = append(buttons, tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("➕ Добавить", cbMenu+"add"),
 		))
 	}
 	buttons = append(buttons, tgbotapi.NewInlineKeyboardRow(
-		tgbotapi.NewInlineKeyboardButtonData("🔙 Назад", "menu:main"),
+		tgbotapi.NewInlineKeyboardButtonData("🔙 Назад", cbMenu+"main"),
 	))
-	msg := tgbotapi.NewMessage(chatID, "📋 Ваши сервисы:")
-	msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(buttons...)
-	b.sendWithCleanup(ctx, chatID, msg)
+	markup := tgbotapi.NewInlineKeyboardMarkup(buttons...)
+	b.sendHTML(ctx, chatID, text, &markup)
+}
+
+// replyServiceError показывает пользователю ошибку сервисного слоя.
+func (b *Bot) replyServiceError(ctx context.Context, chatID int64, err error) {
+	if errors.Is(err, core.ErrNotFound) {
+		b.reply(ctx, chatID, "Сервис не найден")
+		return
+	}
+	b.log.Error("service operation failed", "err", err)
+	b.reply(ctx, chatID, "❌ Ошибка, попробуйте позже")
 }
