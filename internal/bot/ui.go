@@ -38,23 +38,23 @@ func (b *Bot) reply(ctx context.Context, chatID int64, text string) {
 // sendHTML отправляет HTML-сообщение (с необязательной клавиатурой) с
 // очисткой предыдущего. Пользовательские строки в text должны быть уже
 // экранированы.
-func (b *Bot) sendHTML(ctx context.Context, chatID int64, text string, markup *tgbotapi.InlineKeyboardMarkup) {
+func (b *Bot) sendHTML(ctx context.Context, chatID int64, text string, markup *tgbotapi.InlineKeyboardMarkup) error {
 	msg := tgbotapi.NewMessage(chatID, text)
 	msg.ParseMode = tgbotapi.ModeHTML
 	if markup != nil {
 		msg.ReplyMarkup = *markup
 	}
-	b.sendWithCleanup(ctx, chatID, msg)
+	return b.sendWithCleanup(ctx, chatID, msg)
 }
 
 // sendPrompt задаёт вопрос шага flow добавления с кнопкой отмены.
-func (b *Bot) sendPrompt(ctx context.Context, chatID int64, text string) {
+func (b *Bot) sendPrompt(ctx context.Context, chatID int64, text string) error {
 	markup := tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("✖️ Отмена", cbMenu+"cancel"),
 		),
 	)
-	b.sendHTML(ctx, chatID, text, &markup)
+	return b.sendHTML(ctx, chatID, text, &markup)
 }
 
 func (b *Bot) sendHelp(ctx context.Context, chatID int64) {
@@ -63,7 +63,10 @@ func (b *Bot) sendHelp(ctx context.Context, chatID int64) {
 		"/show – показать все сервисы\n" +
 		"/cancel – отменить добавление сервиса\n" +
 		"/help – помощь\n\n" +
-		"Добавление и получение кодов — через кнопки меню."
+		"Добавление и получение кодов — через кнопки меню.\n\n" +
+		"<b>В группе</b> сервисы общие: коды доступны всем участникам, " +
+		"а добавлять и удалять сервисы могут только администраторы. " +
+		"Секрет вводится в личном чате с ботом и в группе не появляется."
 	markup := tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("🔙 Назад", cbMenu+"main"),
@@ -87,8 +90,10 @@ func (b *Bot) sendMainMenu(ctx context.Context, chatID int64, header string) {
 }
 
 // sendWithCleanup отправляет сообщение, предварительно удалив предыдущее
-// сообщение бота в этом чате (id хранится в StateStore).
-func (b *Bot) sendWithCleanup(ctx context.Context, chatID int64, msg tgbotapi.Chattable) {
+// сообщение бота в этом чате (id хранится в StateStore). Ошибку отправки
+// возвращает: большинству вызывающих она не нужна, но по ней, например,
+// видно, что пользователь ещё не открывал личный чат с ботом.
+func (b *Bot) sendWithCleanup(ctx context.Context, chatID int64, msg tgbotapi.Chattable) error {
 	if lastID, ok, _ := b.state.GetLastBotMessage(ctx, chatID); ok {
 		b.api.Request(tgbotapi.NewDeleteMessage(chatID, lastID))
 	}
@@ -98,10 +103,12 @@ func (b *Bot) sendWithCleanup(ctx context.Context, chatID int64, msg tgbotapi.Ch
 		sent, err := b.api.Send(m)
 		if err != nil {
 			b.log.Warn("send message failed", "err", err)
-			return
+			return err
 		}
 		_ = b.state.SetLastBotMessage(ctx, chatID, sent.MessageID)
+		return nil
 	default:
-		b.api.Send(msg)
+		_, err := b.api.Send(msg)
+		return err
 	}
 }
