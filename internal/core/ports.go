@@ -7,16 +7,21 @@ import "context"
 // (ErrNotFound, ErrAlreadyExists). В хранилище секрет всегда лежит
 // зашифрованным, поэтому методы оперируют строкой-шифротекстом, а не
 // SecretValue: шифрование/дешифровка — ответственность сервисного слоя.
+//
+// Секреты адресуются по ID, но ВСЕГДА в паре с владельцем: ID приходит от
+// клиента (callback-данные кнопок можно подделать), поэтому чужой ID обязан
+// давать ErrNotFound, а не доступ к чужому секрету.
 type SecretRepository interface {
-	// Find возвращает ЗАШИФРОВАННЫЙ секрет по владельцу и имени сервиса.
-	Find(ctx context.Context, owner Owner, tag string) (encrypted string, err error)
+	// Find возвращает секрет (с ЗАШИФРОВАННЫМ значением) по владельцу и ID.
+	Find(ctx context.Context, owner Owner, id int64) (SecretRecord, error)
 	// Add сохраняет ЗАШИФРОВАННЫЙ секрет. При дубликате имени —
 	// ErrAlreadyExists.
 	Add(ctx context.Context, owner Owner, tag, encrypted string) error
-	// Delete удаляет сервис. Если сервиса нет — ErrNotFound.
-	Delete(ctx context.Context, owner Owner, tag string) error
-	// List возвращает имена всех сервисов владельца.
-	List(ctx context.Context, owner Owner) ([]string, error)
+	// Delete удаляет сервис и возвращает его имя. Если сервиса нет —
+	// ErrNotFound.
+	Delete(ctx context.Context, owner Owner, id int64) (tag string, err error)
+	// List возвращает сервисы владельца, отсортированные по имени.
+	List(ctx context.Context, owner Owner) ([]SecretInfo, error)
 }
 
 // Crypter — симметричное шифрование секретов. SecretValue на входе/выходе

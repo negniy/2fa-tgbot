@@ -11,5 +11,5 @@ type AddState struct {
 // чтобы инвалидировать его при удалении сервиса.
 type LastCodeMsg struct {
 	MessageID int
-	Service   string
+	SecretID  int64
 }
