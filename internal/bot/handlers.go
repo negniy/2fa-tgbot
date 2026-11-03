@@ -21,6 +21,10 @@ func (b *Bot) handleMessage(ctx context.Context, msg *tgbotapi.Message) {
 	if !msg.IsCommand() && !msg.Chat.IsPrivate() {
 		return
 	}
+	// В группе с несколькими ботами чужие команды не наши.
+	if addressedToOtherBot(msg, b.api.Self.UserName) {
+		return
+	}
 
 	owner, ok := b.resolveOwner(ctx, msg.Chat, msg.From.ID)
 	if !ok {
@@ -37,6 +41,8 @@ func (b *Bot) handleMessage(ctx context.Context, msg *tgbotapi.Message) {
 			b.handleUnknownFlowMessage(ctx, msg)
 		case exists:
 			b.handleAddFlow(ctx, msg, owner, *st)
+		default:
+			b.handleStrayMessage(ctx, msg)
 		}
 		return
 	}
@@ -63,8 +69,22 @@ func (b *Bot) handleMessage(ctx context.Context, msg *tgbotapi.Message) {
 	case "help":
 		b.sendHelp(ctx, msg.Chat.ID)
 	default:
-		b.reply(ctx, msg.Chat.ID, "Неизвестная команда. Введите /menu или /help")
+		// В группе незнакомая команда скорее предназначена другому боту.
+		if msg.Chat.IsPrivate() {
+			b.reply(ctx, msg.Chat.ID, "Неизвестная команда. Введите /menu или /help")
+		}
 	}
+}
+
+// addressedToOtherBot сообщает, что команда явно адресована другому боту
+// (/cmd@other_bot). Без такой проверки msg.Command() отбрасывает адресата,
+// и бот отвечал бы на команды всех ботов группы.
+func addressedToOtherBot(msg *tgbotapi.Message, self string) bool {
+	if !msg.IsCommand() {
+		return false
+	}
+	_, to, found := strings.Cut(msg.CommandWithAt(), "@")
+	return found && !strings.EqualFold(to, self)
 }
 
 // handleCallback обрабатывает нажатия инлайн-кнопок.
@@ -351,6 +371,21 @@ func (b *Bot) handleUnknownFlowMessage(ctx context.Context, msg *tgbotapi.Messag
 		b.warnSecretNotDeleted(msg.Chat.ID)
 	}
 	b.reply(ctx, msg.Chat.ID, msgTemporarilyUnavailable)
+}
+
+// handleStrayMessage обрабатывает текст в личке вне flow добавления. Чаще
+// всего это секрет, присланный после истечения TTL шага (пользователь долго
+// искал ключ), поэтому сообщение удаляется, как и в handleUnknownFlowMessage.
+func (b *Bot) handleStrayMessage(ctx context.Context, msg *tgbotapi.Message) {
+	if msg.Text == "" {
+		return
+	}
+	if !b.deleteUserMessage(msg) {
+		b.warnSecretNotDeleted(msg.Chat.ID)
+	}
+	b.sendMainMenu(ctx, msg.Chat.ID, "🤔 Сейчас я не жду ввода, поэтому удалил "+
+		"сообщение — вдруг это был секрет. Если вы добавляли сервис, время на "+
+		"ввод истекло: начните заново.")
 }
 
 // deleteUserMessage удаляет сообщение пользователя и сообщает, удалось ли.
