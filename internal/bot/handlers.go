@@ -15,6 +15,13 @@ import (
 // handleMessage обрабатывает входящие сообщения: обычный текст — шаг
 // активного flow добавления, команда — команда.
 func (b *Bot) handleMessage(ctx context.Context, msg *tgbotapi.Message) {
+	// В группах обычный текст не обрабатываем: имя и секрет вводятся только
+	// в личке (см. startGroupAdd). Проверка до resolveOwner, чтобы при
+	// отключённых группах не отвечать на каждое сообщение в чате.
+	if !msg.IsCommand() && !msg.Chat.IsPrivate() {
+		return
+	}
+
 	owner, ok := b.resolveOwner(ctx, msg.Chat, msg.From.ID)
 	if !ok {
 		b.reply(ctx, msg.Chat.ID, "Работа в группах отключена.")
@@ -31,6 +38,12 @@ func (b *Bot) handleMessage(ctx context.Context, msg *tgbotapi.Message) {
 		case exists:
 			b.handleAddFlow(ctx, msg, owner, *st)
 		}
+		return
+	}
+
+	// Переход по ссылке из группы продолжает начатое там добавление.
+	if msg.Chat.IsPrivate() && msg.Command() == "start" && msg.CommandArguments() == startAddPayload {
+		b.resumeAddFlow(ctx, msg.Chat.ID, owner)
 		return
 	}
 
@@ -56,7 +69,10 @@ func (b *Bot) handleMessage(ctx context.Context, msg *tgbotapi.Message) {
 
 // handleCallback обрабатывает нажатия инлайн-кнопок.
 func (b *Bot) handleCallback(ctx context.Context, cb *tgbotapi.CallbackQuery) {
-	defer b.api.Request(tgbotapi.NewCallback(cb.ID, ""))
+	// Ответ на callback обязателен (снимает «часики» с кнопки); при отказе
+	// в правах он показывается пользователю всплывающим окном.
+	answer := tgbotapi.NewCallback(cb.ID, "")
+	defer func() { b.api.Request(answer) }()
 
 	chatID := cb.Message.Chat.ID
 	owner, ok := b.resolveOwner(ctx, cb.Message.Chat, cb.From.ID)
@@ -66,6 +82,24 @@ func (b *Bot) handleCallback(ctx context.Context, cb *tgbotapi.CallbackQuery) {
 	}
 
 	data := cb.Data
+	inGroup := !cb.Message.Chat.IsPrivate()
+	if inGroup && requiresGroupAdmin(data) {
+		admin, err := b.isChatAdmin(chatID, cb.From.ID)
+		if err != nil {
+			b.log.Error("get chat member failed", "err", err)
+			answer = tgbotapi.NewCallbackWithAlert(cb.ID, msgTemporarilyUnavailable)
+			return
+		}
+		if !admin {
+			answer = tgbotapi.NewCallbackWithAlert(cb.ID, adminOnlyText)
+			return
+		}
+	}
+	if inGroup && data == cbMenu+"add" {
+		b.startGroupAdd(ctx, cb)
+		return
+	}
+
 	// Любая кнопка, кроме «Добавить», означает, что пользователь ушёл из
 	// flow добавления, — сбрасываем его, чтобы следующий текст не был
 	// принят за имя сервиса или секрет.
@@ -208,12 +242,19 @@ func (b *Bot) deleteService(ctx context.Context, chatID int64, owner core.Owner,
 	b.showServices(ctx, chatID, owner, "❌ Сервис <b>"+html.EscapeString(tag)+"</b> удалён.")
 }
 
-// handleAddFlow ведёт пошаговое добавление сервиса.
+// handleAddFlow ведёт пошаговое добавление сервиса. Вызывается только для
+// личного чата: owner — личный владелец, под которым хранится состояние;
+// сервис сохраняется под target (личный владелец или группа).
 func (b *Bot) handleAddFlow(ctx context.Context, msg *tgbotapi.Message, owner core.Owner, st core.AddState) {
+	target := owner
+	if st.ForGroup() {
+		target = core.NewGroupOwner(st.GroupChatID)
+	}
+
 	switch st.Step {
 	case 1:
 		// Имя проверяем сразу, чтобы не просить секрет впустую.
-		name, err := b.svc.CheckNewName(ctx, owner, msg.Text)
+		name, err := b.svc.CheckNewName(ctx, target, msg.Text)
 		switch {
 		case errors.Is(err, core.ErrInvalidName):
 			b.sendPrompt(ctx, msg.Chat.ID, nameRulesText+"\n\nВведите имя сервиса:")
@@ -240,14 +281,18 @@ func (b *Bot) handleAddFlow(ctx context.Context, msg *tgbotapi.Message, owner co
 	case 2:
 		rawSecret := core.NewSecret(msg.Text)
 
-		// Удаляем сообщение пользователя с секретом сразу (в группах
-		// требуются права на удаление).
-		deleted := b.deleteUserMessage(msg)
-		if !deleted {
+		// Удаляем сообщение пользователя с секретом сразу.
+		if !b.deleteUserMessage(msg) {
 			b.warnSecretNotDeleted(msg.Chat.ID)
 		}
 
-		err := b.svc.AddSecret(ctx, owner, st.Service, rawSecret)
+		// Права проверяем в момент сохранения: за время ввода админку могли
+		// снять, а группы — отключить.
+		if st.ForGroup() && !b.checkGroupAddAllowed(ctx, msg, owner, st) {
+			return
+		}
+
+		err := b.svc.AddSecret(ctx, target, st.Service, rawSecret)
 		if errors.Is(err, core.ErrInvalidSecret) {
 			// Опечатка в ключе — частый случай: остаёмся на шаге 2 и
 			// просим ввести секрет ещё раз.
@@ -256,10 +301,14 @@ func (b *Bot) handleAddFlow(ctx context.Context, msg *tgbotapi.Message, owner co
 		}
 		b.cancelAddFlow(ctx, owner)
 
+		name := html.EscapeString(st.Service)
 		switch {
+		case err == nil && st.ForGroup():
+			b.sendMainMenu(ctx, msg.Chat.ID, "✅ Сервис <b>"+name+
+				"</b> добавлен в группу «<b>"+html.EscapeString(st.GroupTitle)+"</b>».")
+			b.showServices(ctx, st.GroupChatID, target, "➕ Добавлен сервис <b>"+name+"</b>.")
 		case err == nil:
-			b.showServices(ctx, msg.Chat.ID, owner,
-				"✅ Сервис <b>"+html.EscapeString(st.Service)+"</b> добавлен!")
+			b.showServices(ctx, msg.Chat.ID, owner, "✅ Сервис <b>"+name+"</b> добавлен!")
 		case errors.Is(err, core.ErrAlreadyExists):
 			b.reply(ctx, msg.Chat.ID, "⚠️ Сервис с таким именем уже существует")
 		default:
@@ -269,14 +318,35 @@ func (b *Bot) handleAddFlow(ctx context.Context, msg *tgbotapi.Message, owner co
 	}
 }
 
-// handleUnknownFlowMessage обрабатывает текст, пришедший, когда состояние
-// flow добавления прочитать не удалось. В личке сообщение может быть
-// секретом, поэтому удаляем его (обычный текст боту в личку не нужен, так
-// что лишнее удаление безвредно). В группах чужие сообщения не трогаем.
-func (b *Bot) handleUnknownFlowMessage(ctx context.Context, msg *tgbotapi.Message) {
-	if !msg.Chat.IsPrivate() {
-		return
+// checkGroupAddAllowed перед сохранением сервиса группы проверяет, что
+// группы включены и пользователь всё ещё администратор. Если нет —
+// сообщает пользователю и возвращает false (flow при отказе сбрасывается,
+// при сбое проверки — сохраняется, чтобы можно было повторить ввод).
+func (b *Bot) checkGroupAddAllowed(ctx context.Context, msg *tgbotapi.Message, owner core.Owner, st core.AddState) bool {
+	if !b.enableGroups {
+		b.cancelAddFlow(ctx, owner)
+		b.reply(ctx, msg.Chat.ID, "Работа в группах отключена.")
+		return false
 	}
+	admin, err := b.isChatAdmin(st.GroupChatID, msg.From.ID)
+	if err != nil {
+		b.log.Error("get chat member failed", "err", err)
+		b.sendPrompt(ctx, msg.Chat.ID, msgTemporarilyUnavailable+"\n\n"+secretPromptText)
+		return false
+	}
+	if !admin {
+		b.cancelAddFlow(ctx, owner)
+		b.sendMainMenu(ctx, msg.Chat.ID, "⛔ "+adminOnlyText+" Сервис не добавлен.")
+		return false
+	}
+	return true
+}
+
+// handleUnknownFlowMessage обрабатывает текст в личке, пришедший, когда
+// состояние flow добавления прочитать не удалось. Сообщение может быть
+// секретом, поэтому удаляем его (обычный текст боту в личку не нужен, так
+// что лишнее удаление безвредно).
+func (b *Bot) handleUnknownFlowMessage(ctx context.Context, msg *tgbotapi.Message) {
 	if !b.deleteUserMessage(msg) {
 		b.warnSecretNotDeleted(msg.Chat.ID)
 	}
@@ -297,8 +367,7 @@ func (b *Bot) deleteUserMessage(msg *tgbotapi.Message) bool {
 // стёрлось следующим ответом бота.
 func (b *Bot) warnSecretNotDeleted(chatID int64) {
 	b.api.Send(tgbotapi.NewMessage(chatID,
-		"⚠️ Не удалось удалить сообщение с секретом — удалите его вручную. "+
-			"В группе боту нужно право администратора на удаление сообщений."))
+		"⚠️ Не удалось удалить сообщение с секретом — удалите его вручную."))
 }
 
 // showServices показывает список сервисов владельца. header (HTML, уже

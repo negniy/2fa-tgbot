@@ -149,3 +149,23 @@ func TestRedisMessageRefsDegradation(t *testing.T) {
 		t.Fatalf("set lastcode: %v", err)
 	}
 }
+
+// TestRedisAddStateGroupTarget: поля группы переживают сериализацию —
+// иначе добавление «для группы» тихо сохранило бы сервис лично.
+func TestRedisAddStateGroupTarget(t *testing.T) {
+	ctx := context.Background()
+	s, _ := newTestRedisStore(t)
+	owner := core.NewUserOwner(3)
+
+	want := core.AddState{Step: 2, Service: "gh", GroupChatID: -100123, GroupTitle: "Команда"}
+	if err := s.SetAddState(ctx, owner, want); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := s.GetAddState(ctx, owner)
+	if err != nil || !ok || *got != want {
+		t.Fatalf("got %+v ok=%v err=%v, want %+v", got, ok, err, want)
+	}
+	if !got.ForGroup() {
+		t.Fatal("ForGroup() must be true")
+	}
+}
