@@ -212,27 +212,49 @@ func (b *Bot) deleteService(ctx context.Context, chatID int64, owner core.Owner,
 func (b *Bot) handleAddFlow(ctx context.Context, msg *tgbotapi.Message, owner core.Owner, st core.AddState) {
 	switch st.Step {
 	case 1:
-		st.Service = strings.TrimSpace(msg.Text)
+		// Имя проверяем сразу, чтобы не просить секрет впустую.
+		name, err := b.svc.CheckNewName(ctx, owner, msg.Text)
+		switch {
+		case errors.Is(err, core.ErrInvalidName):
+			b.sendPrompt(ctx, msg.Chat.ID, nameRulesText+"\n\nВведите имя сервиса:")
+			return
+		case errors.Is(err, core.ErrAlreadyExists):
+			b.sendPrompt(ctx, msg.Chat.ID, "⚠️ Сервис <b>"+html.EscapeString(name)+
+				"</b> уже есть. Введите другое имя:")
+			return
+		case err != nil:
+			b.log.Error("check service name failed", "err", err)
+			b.reply(ctx, msg.Chat.ID, msgTemporarilyUnavailable)
+			return
+		}
+
+		st.Service = name
 		st.Step = 2
 		if err := b.state.SetAddState(ctx, owner, st); err != nil {
 			b.log.Error("set add state failed", "err", err)
 			b.reply(ctx, msg.Chat.ID, msgTemporarilyUnavailable)
 			return
 		}
-		b.sendPrompt(ctx, msg.Chat.ID, "Теперь введите секрет (base32):")
+		b.sendPrompt(ctx, msg.Chat.ID, secretPromptText)
 
 	case 2:
-		rawSecret := core.NewSecret(strings.TrimSpace(msg.Text))
+		rawSecret := core.NewSecret(msg.Text)
 
 		// Удаляем сообщение пользователя с секретом сразу (в группах
 		// требуются права на удаление).
 		deleted := b.deleteUserMessage(msg)
-
-		err := b.svc.AddSecret(ctx, owner, st.Service, rawSecret)
-		b.cancelAddFlow(ctx, owner)
 		if !deleted {
 			b.warnSecretNotDeleted(msg.Chat.ID)
 		}
+
+		err := b.svc.AddSecret(ctx, owner, st.Service, rawSecret)
+		if errors.Is(err, core.ErrInvalidSecret) {
+			// Опечатка в ключе — частый случай: остаёмся на шаге 2 и
+			// просим ввести секрет ещё раз.
+			b.sendPrompt(ctx, msg.Chat.ID, "⚠️ Это не похоже на секретный ключ.\n\n"+secretPromptText)
+			return
+		}
+		b.cancelAddFlow(ctx, owner)
 
 		switch {
 		case err == nil:
@@ -241,6 +263,7 @@ func (b *Bot) handleAddFlow(ctx context.Context, msg *tgbotapi.Message, owner co
 		case errors.Is(err, core.ErrAlreadyExists):
 			b.reply(ctx, msg.Chat.ID, "⚠️ Сервис с таким именем уже существует")
 		default:
+			b.log.Error("add secret failed", "err", err)
 			b.reply(ctx, msg.Chat.ID, "❌ Ошибка при добавлении сервиса")
 		}
 	}

@@ -83,6 +83,9 @@ type fakeTOTP struct{}
 
 func (fakeTOTP) Generate(secret SecretValue) (string, error) { return "code-" + secret.Reveal(), nil }
 
+// validSecret — корректный base32-ключ (80 бит).
+const validSecret = "JBSWY3DPEHPK3PXP"
+
 func newTestService(repo SecretRepository) *SecretService {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	return NewSecretService(repo, fakeCrypter{}, fakeTOTP{}, nil, log)
@@ -94,11 +97,12 @@ func TestServiceAddGetDelete(t *testing.T) {
 	svc := newTestService(repo)
 	owner := NewUserOwner(1)
 
-	if err := svc.AddSecret(ctx, owner, "github", NewSecret("S1")); err != nil {
+	// Имя и секрет приходят «как ввёл пользователь» и нормализуются.
+	if err := svc.AddSecret(ctx, owner, "  github  ", NewSecret("jbsw y3dp ehpk 3pxp")); err != nil {
 		t.Fatal(err)
 	}
-	if got := repo.records[1].rec.Encrypted; got != "enc:S1" {
-		t.Fatalf("repo stored %q, want encrypted value", got)
+	if got := repo.records[1].rec.Encrypted; got != "enc:"+validSecret {
+		t.Fatalf("repo stored %q, want encrypted normalized secret", got)
 	}
 
 	list, err := svc.ListSecrets(ctx, owner)
@@ -111,7 +115,7 @@ func TestServiceAddGetDelete(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.Tag != "github" || res.Code != "code-S1" {
+	if res.Tag != "github" || res.Code != "code-"+validSecret {
 		t.Fatalf("unexpected code result: %+v", res)
 	}
 	if res.SecondsRemaining < 1 || res.SecondsRemaining > 30 {
@@ -134,7 +138,7 @@ func TestServiceForeignIDNotFound(t *testing.T) {
 	svc := newTestService(newFakeRepo())
 	alice, mallory := NewUserOwner(1), NewUserOwner(2)
 
-	if err := svc.AddSecret(ctx, alice, "bank", NewSecret("S")); err != nil {
+	if err := svc.AddSecret(ctx, alice, "bank", NewSecret(validSecret)); err != nil {
 		t.Fatal(err)
 	}
 	const aliceSecretID = 1
@@ -158,8 +162,47 @@ func TestServiceAddDuplicate(t *testing.T) {
 	svc := newTestService(newFakeRepo())
 	owner := NewUserOwner(1)
 
-	_ = svc.AddSecret(ctx, owner, "gh", NewSecret("A"))
-	if err := svc.AddSecret(ctx, owner, "gh", NewSecret("B")); !errors.Is(err, ErrAlreadyExists) {
+	_ = svc.AddSecret(ctx, owner, "gh", NewSecret(validSecret))
+	if err := svc.AddSecret(ctx, owner, "gh", NewSecret(validSecret)); !errors.Is(err, ErrAlreadyExists) {
 		t.Fatalf("err = %v, want ErrAlreadyExists", err)
+	}
+}
+
+// TestServiceAddRejectsInvalid: невалидный ввод не доходит до репозитория.
+func TestServiceAddRejectsInvalid(t *testing.T) {
+	ctx := context.Background()
+	repo := newFakeRepo()
+	svc := newTestService(repo)
+	owner := NewUserOwner(1)
+
+	if err := svc.AddSecret(ctx, owner, "gh", NewSecret("not-a-secret!")); !errors.Is(err, ErrInvalidSecret) {
+		t.Fatalf("bad secret: err = %v", err)
+	}
+	if err := svc.AddSecret(ctx, owner, "   ", NewSecret(validSecret)); !errors.Is(err, ErrInvalidName) {
+		t.Fatalf("bad name: err = %v", err)
+	}
+	if len(repo.records) != 0 {
+		t.Fatalf("invalid input reached repository: %+v", repo.records)
+	}
+}
+
+func TestServiceCheckNewName(t *testing.T) {
+	ctx := context.Background()
+	svc := newTestService(newFakeRepo())
+	owner := NewUserOwner(1)
+	_ = svc.AddSecret(ctx, owner, "work mail", NewSecret(validSecret))
+
+	if name, err := svc.CheckNewName(ctx, owner, "  new	one "); err != nil || name != "new one" {
+		t.Fatalf("got name=%q err=%v", name, err)
+	}
+	if _, err := svc.CheckNewName(ctx, owner, " work   mail "); !errors.Is(err, ErrAlreadyExists) {
+		t.Fatalf("duplicate after normalization: err = %v", err)
+	}
+	if _, err := svc.CheckNewName(ctx, owner, "/start"); !errors.Is(err, ErrInvalidName) {
+		t.Fatalf("command-like name: err = %v", err)
+	}
+	// У другого владельца то же имя свободно.
+	if _, err := svc.CheckNewName(ctx, NewGroupOwner(1), "work mail"); err != nil {
+		t.Fatalf("other owner: err = %v", err)
 	}
 }
