@@ -95,6 +95,55 @@ func TestGracefulDrain(t *testing.T) {
 	}
 }
 
+// TestPanicDoesNotKillWorker: паника в обработчике одного апдейта не
+// останавливает воркер — следующие апдейты того же шарда обрабатываются.
+func TestPanicDoesNotKillWorker(t *testing.T) {
+	var processed int64
+	handler := func(ctx context.Context, u tgbotapi.Update) {
+		if u.Message.MessageID == 1 {
+			panic("boom")
+		}
+		atomic.AddInt64(&processed, 1)
+	}
+
+	p := newWorkerPool(1, 10, handler, testLogger())
+	p.start(context.Background())
+	for i := 1; i <= 3; i++ {
+		u := privateUpdate(1)
+		u.Message.MessageID = i
+		p.submit(u)
+	}
+	p.stop()
+
+	if got := atomic.LoadInt64(&processed); got != 2 {
+		t.Fatalf("expected 2 processed after panic, got %d", got)
+	}
+}
+
+// TestDrainWithCancelledContext: после отмены корневого контекста уже
+// принятые апдейты дообрабатываются с НЕотменённым контекстом.
+func TestDrainWithCancelledContext(t *testing.T) {
+	var cancelledSeen int64
+	handler := func(ctx context.Context, u tgbotapi.Update) {
+		if ctx.Err() != nil {
+			atomic.AddInt64(&cancelledSeen, 1)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	p := newWorkerPool(2, 10, handler, testLogger())
+	p.start(ctx)
+	cancel()
+	for i := 0; i < 5; i++ {
+		p.submit(privateUpdate(int64(i)))
+	}
+	p.stop()
+
+	if n := atomic.LoadInt64(&cancelledSeen); n != 0 {
+		t.Fatalf("handlers saw cancelled context %d times", n)
+	}
+}
+
 // TestSubmitDropsWhenFull: переполнение очереди не блокирует, апдейт
 // отбрасывается (защита от флуда).
 func TestSubmitDropsWhenFull(t *testing.T) {

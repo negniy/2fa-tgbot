@@ -3,6 +3,7 @@ package bot
 import (
 	"context"
 	"log/slog"
+	"time"
 
 	"2fa-tgbot/internal/core"
 
@@ -91,13 +92,32 @@ func (b *Bot) Run(ctx context.Context) error {
 	}
 }
 
-// dispatch направляет апдейт нужному обработчику.
+// updateTimeout ограничивает обработку одного апдейта, чтобы зависший
+// запрос к БД или Redis не блокировал шард навсегда.
+const updateTimeout = 30 * time.Second
+
+// dispatch направляет апдейт нужному обработчику. Апдейты без отправителя
+// или чата (служебные, инлайн-сообщения) игнорируются: обработчики
+// рассчитывают на наличие обоих.
 func (b *Bot) dispatch(ctx context.Context, update tgbotapi.Update) {
+	ctx, cancel := context.WithTimeout(ctx, updateTimeout)
+	defer cancel()
+
 	switch {
 	case update.Message != nil:
-		b.handleMessage(ctx, update.Message)
+		msg := update.Message
+		if msg.From == nil || msg.Chat == nil {
+			return
+		}
+		b.handleMessage(ctx, msg)
 	case update.CallbackQuery != nil:
-		b.handleCallback(ctx, update.CallbackQuery)
+		cb := update.CallbackQuery
+		if cb.From == nil || cb.Message == nil || cb.Message.Chat == nil {
+			// Снимаем «часики» с кнопки, даже если обработать не можем.
+			b.api.Request(tgbotapi.NewCallback(cb.ID, ""))
+			return
+		}
+		b.handleCallback(ctx, cb)
 	}
 }
 

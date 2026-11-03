@@ -6,6 +6,9 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
+// msgTemporarilyUnavailable — ответ при сбое инфраструктуры (Redis/БД).
+const msgTemporarilyUnavailable = "⏳ Сервис временно недоступен, попробуйте позже."
+
 // reply отправляет простое текстовое сообщение с очисткой предыдущего.
 func (b *Bot) reply(ctx context.Context, chatID int64, text string) {
 	b.sendWithCleanup(ctx, chatID, tgbotapi.NewMessage(chatID, text))

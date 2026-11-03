@@ -3,6 +3,7 @@ package state
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"strconv"
 	"time"
@@ -23,9 +24,13 @@ const (
 
 // RedisStore реализует core.StateStore поверх Redis.
 //
-// Мягкая деградация: ошибки Redis не роняют бота и не мешают чтению
-// секретов (оно идёт в Postgres, а не сюда). Ошибки логируются; операции
-// чтения при сбое возвращают «пусто», операции записи — тихо не срабатывают.
+// Ошибки Redis не роняют бота и не мешают чтению секретов (оно идёт в
+// Postgres, а не сюда). Политика различается по виду состояния:
+//   - flow добавления — fail-closed: ошибки пробрасываются. Иначе бот мог бы
+//     пообещать «введите секрет», не запомнив шаг, и сообщение с секретом
+//     осталось бы в чате необработанным (и неудалённым);
+//   - ссылки на последние сообщения — мягкая деградация: это косметика,
+//     ошибки логируются, чтение возвращает «пусто», запись тихо не срабатывает.
 type RedisStore struct {
 	rdb *redis.Client
 	log *slog.Logger
@@ -58,13 +63,11 @@ func (s *RedisStore) GetAddState(ctx context.Context, owner core.Owner) (*core.A
 		return nil, false, nil
 	}
 	if err != nil {
-		// Деградация: считаем, что активного flow нет. Так сообщение будет
-		// обработано как обычная команда, а не как шаг ввода секрета.
-		s.log.Warn("redis get addstate failed", "err", err)
-		return nil, false, nil
+		return nil, false, fmt.Errorf("redis get addstate: %w", err)
 	}
 	var st core.AddState
 	if err := json.Unmarshal(raw, &st); err != nil {
+		// Битое значение не лечится повтором — считаем, что flow нет.
 		s.log.Warn("addstate unmarshal failed", "err", err)
 		return nil, false, nil
 	}
@@ -77,15 +80,14 @@ func (s *RedisStore) SetAddState(ctx context.Context, owner core.Owner, st core.
 		return err
 	}
 	if err := s.rdb.Set(ctx, addStateKey(owner), data, addStateTTL).Err(); err != nil {
-		s.log.Warn("redis set addstate failed", "err", err)
-		// Деградация: не пробрасываем — flow добавления просто не сработает.
+		return fmt.Errorf("redis set addstate: %w", err)
 	}
 	return nil
 }
 
 func (s *RedisStore) DeleteAddState(ctx context.Context, owner core.Owner) error {
 	if err := s.rdb.Del(ctx, addStateKey(owner)).Err(); err != nil {
-		s.log.Warn("redis del addstate failed", "err", err)
+		return fmt.Errorf("redis del addstate: %w", err)
 	}
 	return nil
 }

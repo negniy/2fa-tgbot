@@ -106,9 +106,10 @@ func TestRedisLastBotMessage(t *testing.T) {
 	}
 }
 
-// TestRedisDegradation проверяет мягкую деградацию: когда Redis недоступен,
-// чтение возвращает «пусто» без ошибки, а не паникует.
-func TestRedisDegradation(t *testing.T) {
+// TestRedisAddStateFailClosed: когда Redis недоступен, операции flow
+// добавления возвращают ошибку — вызывающий код обязан об этом узнать,
+// чтобы не потерять сообщение с секретом.
+func TestRedisAddStateFailClosed(t *testing.T) {
 	ctx := context.Background()
 	s, mr := newTestRedisStore(t)
 	owner := core.NewUserOwner(5)
@@ -116,17 +117,35 @@ func TestRedisDegradation(t *testing.T) {
 	_ = s.SetAddState(ctx, owner, core.AddState{Step: 1})
 	mr.Close() // Redis «упал».
 
-	// Чтение не должно паниковать и должно вернуть «нет состояния».
-	st, ok, err := s.GetAddState(ctx, owner)
-	if err != nil {
-		t.Fatalf("degradation should not return error, got %v", err)
+	if _, _, err := s.GetAddState(ctx, owner); err == nil {
+		t.Fatal("get with redis down should return error")
 	}
-	if ok || st != nil {
-		t.Fatal("with redis down, expected no active state")
+	if err := s.SetAddState(ctx, owner, core.AddState{Step: 2}); err == nil {
+		t.Fatal("set with redis down should return error")
 	}
+	if err := s.DeleteAddState(ctx, owner); err == nil {
+		t.Fatal("delete with redis down should return error")
+	}
+}
 
-	// Запись тоже не должна паниковать/возвращать ошибку.
-	if err := s.SetAddState(ctx, owner, core.AddState{Step: 2}); err != nil {
-		t.Fatalf("degraded set should not error, got %v", err)
+// TestRedisMessageRefsDegradation: ссылки на сообщения — косметика, при
+// недоступном Redis они деградируют мягко: «пусто» и без ошибок.
+func TestRedisMessageRefsDegradation(t *testing.T) {
+	ctx := context.Background()
+	s, mr := newTestRedisStore(t)
+	owner := core.NewUserOwner(5)
+	mr.Close()
+
+	if _, ok, err := s.GetLastBotMessage(ctx, 1); err != nil || ok {
+		t.Fatalf("lastmsg: ok=%v err=%v", ok, err)
+	}
+	if err := s.SetLastBotMessage(ctx, 1, 2); err != nil {
+		t.Fatalf("set lastmsg: %v", err)
+	}
+	if _, ok, err := s.GetLastCodeMessage(ctx, owner); err != nil || ok {
+		t.Fatalf("lastcode: ok=%v err=%v", ok, err)
+	}
+	if err := s.SetLastCodeMessage(ctx, owner, core.LastCodeMsg{}); err != nil {
+		t.Fatalf("set lastcode: %v", err)
 	}
 }

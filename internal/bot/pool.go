@@ -4,6 +4,7 @@ import (
 	"context"
 	"hash/fnv"
 	"log/slog"
+	"runtime/debug"
 	"sync"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -47,18 +48,33 @@ func newWorkerPool(
 	return p
 }
 
-// start запускает воркеры. ctx передаётся в обработчики; при его отмене
-// диспетчер перестаёт слать апдейты и закрывает очереди (см. stop).
+// start запускает воркеры. Отмена ctx НЕ передаётся в обработчики: при
+// остановке диспетчер закрывает очереди (см. stop), а уже принятые апдейты
+// должны дообработаться с рабочим контекстом, иначе их запросы к БД сразу
+// упадут с context canceled. Значения контекста (если есть) сохраняются.
 func (p *workerPool) start(ctx context.Context) {
+	handlerCtx := context.WithoutCancel(ctx)
 	for i := range p.queues {
 		p.wg.Add(1)
 		go func(q chan tgbotapi.Update) {
 			defer p.wg.Done()
 			for u := range q {
-				p.handler(ctx, u)
+				p.safeHandle(handlerCtx, u)
 			}
 		}(p.queues[i])
 	}
+}
+
+// safeHandle вызывает обработчик, перехватывая панику: ошибка в одном
+// апдейте не должна ронять воркер (и весь процесс).
+func (p *workerPool) safeHandle(ctx context.Context, u tgbotapi.Update) {
+	defer func() {
+		if r := recover(); r != nil {
+			p.log.Error("panic in update handler",
+				"update_id", u.UpdateID, "panic", r, "stack", string(debug.Stack()))
+		}
+	}()
+	p.handler(ctx, u)
 }
 
 // submit кладёт апдейт в шард по ключу маршрутизации. Возвращает false,

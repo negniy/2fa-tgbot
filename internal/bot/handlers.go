@@ -21,7 +21,14 @@ func (b *Bot) handleMessage(ctx context.Context, msg *tgbotapi.Message) {
 	}
 
 	// Активный пошаговый ввод?
-	if st, exists, err := b.state.GetAddState(ctx, owner); err == nil && exists {
+	st, exists, err := b.state.GetAddState(ctx, owner)
+	switch {
+	case err != nil && !msg.IsCommand():
+		// Не знаем, идёт ли ввод: сообщение может оказаться секретом.
+		b.log.Error("get add state failed", "err", err)
+		b.handleUnknownFlowMessage(ctx, msg)
+		return
+	case err == nil && exists:
 		b.handleAddFlow(ctx, msg, owner, *st)
 		return
 	}
@@ -73,7 +80,11 @@ func (b *Bot) handleMenu(ctx context.Context, chatID int64, owner core.Owner, ac
 	case "show":
 		b.showServices(ctx, chatID, owner)
 	case "add":
-		_ = b.state.SetAddState(ctx, owner, core.AddState{Step: 1})
+		if err := b.state.SetAddState(ctx, owner, core.AddState{Step: 1}); err != nil {
+			b.log.Error("set add state failed", "err", err)
+			b.reply(ctx, chatID, msgTemporarilyUnavailable)
+			return
+		}
 		b.reply(ctx, chatID, "Введите имя сервиса:")
 	case "help":
 		b.sendHelp(chatID)
@@ -160,7 +171,11 @@ func (b *Bot) handleAddFlow(ctx context.Context, msg *tgbotapi.Message, owner co
 	case 1:
 		st.Service = strings.TrimSpace(msg.Text)
 		st.Step = 2
-		_ = b.state.SetAddState(ctx, owner, st)
+		if err := b.state.SetAddState(ctx, owner, st); err != nil {
+			b.log.Error("set add state failed", "err", err)
+			b.reply(ctx, msg.Chat.ID, msgTemporarilyUnavailable)
+			return
+		}
 		b.reply(ctx, msg.Chat.ID, "Теперь введите секрет (base32):")
 
 	case 2:
@@ -168,10 +183,16 @@ func (b *Bot) handleAddFlow(ctx context.Context, msg *tgbotapi.Message, owner co
 
 		// Удаляем сообщение пользователя с секретом сразу (в группах
 		// требуются права на удаление).
-		b.api.Request(tgbotapi.NewDeleteMessage(msg.Chat.ID, msg.MessageID))
+		deleted := b.deleteUserMessage(msg)
 
 		err := b.svc.AddSecret(ctx, owner, st.Service, rawSecret)
-		_ = b.state.DeleteAddState(ctx, owner)
+		if derr := b.state.DeleteAddState(ctx, owner); derr != nil {
+			// Не критично: состояние истечёт по TTL.
+			b.log.Warn("delete add state failed", "err", derr)
+		}
+		if !deleted {
+			b.warnSecretNotDeleted(msg.Chat.ID)
+		}
 
 		switch {
 		case err == nil:
@@ -183,6 +204,38 @@ func (b *Bot) handleAddFlow(ctx context.Context, msg *tgbotapi.Message, owner co
 			b.reply(ctx, msg.Chat.ID, "❌ Ошибка при добавлении сервиса")
 		}
 	}
+}
+
+// handleUnknownFlowMessage обрабатывает текст, пришедший, когда состояние
+// flow добавления прочитать не удалось. В личке сообщение может быть
+// секретом, поэтому удаляем его (обычный текст боту в личку не нужен, так
+// что лишнее удаление безвредно). В группах чужие сообщения не трогаем.
+func (b *Bot) handleUnknownFlowMessage(ctx context.Context, msg *tgbotapi.Message) {
+	if !msg.Chat.IsPrivate() {
+		return
+	}
+	if !b.deleteUserMessage(msg) {
+		b.warnSecretNotDeleted(msg.Chat.ID)
+	}
+	b.reply(ctx, msg.Chat.ID, msgTemporarilyUnavailable)
+}
+
+// deleteUserMessage удаляет сообщение пользователя и сообщает, удалось ли.
+func (b *Bot) deleteUserMessage(msg *tgbotapi.Message) bool {
+	if _, err := b.api.Request(tgbotapi.NewDeleteMessage(msg.Chat.ID, msg.MessageID)); err != nil {
+		b.log.Warn("delete user message failed", "chat_type", msg.Chat.Type, "err", err)
+		return false
+	}
+	return true
+}
+
+// warnSecretNotDeleted просит пользователя удалить сообщение с секретом
+// вручную. Отправляется в обход sendWithCleanup, чтобы предупреждение не
+// стёрлось следующим ответом бота.
+func (b *Bot) warnSecretNotDeleted(chatID int64) {
+	b.api.Send(tgbotapi.NewMessage(chatID,
+		"⚠️ Не удалось удалить сообщение с секретом — удалите его вручную. "+
+			"В группе боту нужно право администратора на удаление сообщений."))
 }
 
 func (b *Bot) showServices(ctx context.Context, chatID int64, owner core.Owner) {
